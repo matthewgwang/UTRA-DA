@@ -321,6 +321,22 @@ def analyze_run():
             checkpoint_misses = 0
             ultrasonic_readings = []
 
+            # New: Calculate velocity and acceleration data
+            velocities = []
+            accelerations = []
+            speed_over_time = []  # For charting
+
+            # New: Stuck detection
+            stuck_events = []
+            stuck_threshold_ms = 500  # Consider stuck if no movement for 500ms
+            position_threshold = 3  # Consider stuck if moved less than 3 units
+
+            # New: Heatmap data (grid-based position frequency)
+            heatmap_grid_size = 50  # Grid cell size in units
+            heatmap_data = {}  # {(grid_x, grid_y): count}
+
+            prev_x, prev_y, prev_time = None, None, None
+
             for i, log in enumerate(logs):
                 timestamp_ms = log.get("timestamp_ms", 0)
                 section_id = log.get("section_id", 0)
@@ -328,8 +344,64 @@ def analyze_run():
                 checkpoint = log.get("checkpoint_success", 0)
                 ultrasonic = log.get("ultrasonic_distance", 0)
                 claw = log.get("claw_status", 0)
+                x = log.get("x", 0)
+                y = log.get("y", 0)
 
                 ultrasonic_readings.append(ultrasonic)
+
+                # Heatmap: Add position to grid
+                grid_x = int(x // heatmap_grid_size)
+                grid_y = int(y // heatmap_grid_size)
+                grid_key = f"{grid_x},{grid_y}"
+                heatmap_data[grid_key] = heatmap_data.get(grid_key, 0) + 1
+
+                # Velocity and acceleration calculation
+                if prev_x is not None and prev_time is not None:
+                    dt = (timestamp_ms - prev_time) / 1000.0  # Convert to seconds
+                    if dt > 0:
+                        dx = x - prev_x
+                        dy = y - prev_y
+                        distance = (dx**2 + dy**2)**0.5
+                        velocity = distance / dt  # units per second
+
+                        velocities.append(velocity)
+                        speed_over_time.append({
+                            "time_ms": timestamp_ms,
+                            "speed": round(velocity, 2)
+                        })
+
+                        # Acceleration (change in velocity)
+                        if len(velocities) >= 2:
+                            prev_velocity = velocities[-2]
+                            accel = (velocity - prev_velocity) / dt
+                            accelerations.append({
+                                "time_ms": timestamp_ms,
+                                "acceleration": round(accel, 2),
+                                "x": x,
+                                "y": y
+                            })
+
+                        # Stuck detection: low velocity for extended period
+                        if velocity < 5:  # Very low speed threshold
+                            if stuck_events and stuck_events[-1].get("end_time") is None:
+                                # Continue existing stuck event
+                                stuck_events[-1]["duration_ms"] = timestamp_ms - stuck_events[-1]["start_time"]
+                            else:
+                                # Start new stuck event
+                                stuck_events.append({
+                                    "start_time": timestamp_ms,
+                                    "end_time": None,
+                                    "duration_ms": 0,
+                                    "x": x,
+                                    "y": y,
+                                    "section": section_name
+                                })
+                        else:
+                            # End stuck event if moving again
+                            if stuck_events and stuck_events[-1].get("end_time") is None:
+                                stuck_events[-1]["end_time"] = timestamp_ms
+
+                prev_x, prev_y, prev_time = x, y, timestamp_ms
 
                 # Track checkpoint hits/misses
                 if checkpoint == 1:
@@ -466,6 +538,43 @@ Please provide:
             base_analysis["checkpoint_rate"] = checkpoint_rate
             base_analysis["ultrasonic_avg"] = ultrasonic_avg
 
+            # Add velocity/acceleration data (sample every 10th point to reduce size)
+            base_analysis["speed_over_time"] = speed_over_time[::10] if len(speed_over_time) > 100 else speed_over_time
+            base_analysis["acceleration_data"] = accelerations[::10] if len(accelerations) > 100 else accelerations
+
+            # Calculate acceleration stats
+            if accelerations:
+                accel_values = [a["acceleration"] for a in accelerations]
+                base_analysis["acceleration_stats"] = {
+                    "max": round(max(accel_values), 2),
+                    "min": round(min(accel_values), 2),
+                    "avg": round(sum(accel_values) / len(accel_values), 2),
+                    "jerky_count": sum(1 for a in accel_values if abs(a) > 100)  # Count sudden changes
+                }
+
+            # Filter stuck events (only those lasting > 300ms are significant)
+            significant_stuck = [s for s in stuck_events if s.get("duration_ms", 0) > 300]
+            base_analysis["stuck_events"] = significant_stuck
+            base_analysis["stuck_frequency"] = {
+                "total_stuck_events": len(significant_stuck),
+                "total_stuck_time_ms": sum(s.get("duration_ms", 0) for s in significant_stuck),
+                "stuck_locations": [{"x": s["x"], "y": s["y"], "section": s["section"], "duration_ms": s["duration_ms"]} for s in significant_stuck]
+            }
+
+            # Convert heatmap to list format for frontend
+            heatmap_list = []
+            for key, count in heatmap_data.items():
+                gx, gy = map(int, key.split(","))
+                heatmap_list.append({
+                    "grid_x": gx,
+                    "grid_y": gy,
+                    "x": gx * heatmap_grid_size + heatmap_grid_size // 2,
+                    "y": gy * heatmap_grid_size + heatmap_grid_size // 2,
+                    "count": count
+                })
+            base_analysis["heatmap_data"] = sorted(heatmap_list, key=lambda h: h["count"], reverse=True)
+            base_analysis["heatmap_max_count"] = max(h["count"] for h in heatmap_list) if heatmap_list else 1
+
         if not OPENROUTER_API_KEY:
             analysis = {
                 **base_analysis,
@@ -481,7 +590,7 @@ Please provide:
                 "X-Title": "UTRA Data Analysis"
             }
             payload = {
-                "model": "google/gemini-3-flash-preview",
+                "model": "google/gemini-2.0-flash-001",
                 "messages": [
                     {"role": "system", "content": "You are an expert robotics competition coach."},
                     {"role": "user", "content": prompt}

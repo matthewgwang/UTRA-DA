@@ -1,19 +1,7 @@
-"""
-UTRA Data Analysis - Flask Backend
-Member A Responsibility: Backend & Bridge Engineer
-
-Endpoints:
-- POST /ingest: Save raw JSON logs to MongoDB
-- GET /runs: Return list of past runs
-- GET /runs/<run_id>: Get detailed run info
-- POST /analyze: Send run data to OpenRouter for AI analysis
-- POST /telemetry: Ingest real-time telemetry
-- GET /telemetry/latest: Get latest telemetry reading
-"""
-
 import os
 from datetime import datetime
-from flask import Flask, request, jsonify
+
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from pymongo import MongoClient
 from bson import ObjectId
@@ -22,17 +10,33 @@ import requests
 
 load_dotenv()
 
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+FRONTEND_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend"))
+DIST_DIR = os.path.join(FRONTEND_DIR, "dist")  # Vite production build output
+
+# Create Flask app (API + optional static serving)
 app = Flask(__name__)
 CORS(app)
 
+# -----------------------------------------------------------------------------
 # MongoDB Configuration
+# -----------------------------------------------------------------------------
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/utra_da")
 client = MongoClient(MONGODB_URI)
-db = client.get_default_database() if "utra_da" in MONGODB_URI else client["utra_da"]
+
+# If URI explicitly includes a DB, get_default_database() can work.
+# Otherwise, fall back to a known DB name.
+try:
+    db = client.get_default_database()
+except Exception:
+    db = client["utra_da"]
+
 runs_collection = db["runs"]
 telemetry_collection = db["telemetry"]
 
+# -----------------------------------------------------------------------------
 # OpenRouter Configuration
+# -----------------------------------------------------------------------------
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -74,6 +78,13 @@ ZONE_NAMES = {
     5: "Unknown"
 }
 
+# Section names for new sensor data format
+SECTION_NAMES = {
+    1: "Red Path",
+    2: "Ramp",
+    3: "Green Path"
+}
+
 
 def serialize_doc(doc):
     """Convert MongoDB document to JSON-serializable dict."""
@@ -87,9 +98,11 @@ def serialize_doc(doc):
     return doc
 
 
+# -----------------------------------------------------------------------------
+# API Routes
+# -----------------------------------------------------------------------------
 @app.route("/health", methods=["GET"])
 def health_check():
-    """Health check endpoint."""
     return jsonify({"status": "healthy", "timestamp": datetime.utcnow().isoformat()})
 
 
@@ -98,21 +111,10 @@ def ingest_data():
     """
     POST /ingest
     Save raw JSON logs from robot EEPROM to MongoDB.
-
-    Expected payload:
-    {
-        "robot_id": "robot_001",
-        "run_number": 1,
-        "logs": [
-            {"event": 1, "data": 0, "timestamp": 0},
-            {"event": 2, "data": 1, "timestamp": 1500},
-            ...
-        ],
-        "metadata": {
-            "battery_voltage": 7.4,
-            "firmware_version": "1.0.0"
-        }
-    }
+    Supports multiple formats:
+    - Path format: includes x,y positions, segments, and events
+    - Sensor format: section_id based
+    - Event format: Arduino EEPROM events
     """
     try:
         data = request.get_json()
@@ -123,79 +125,70 @@ def ingest_data():
         if "logs" not in data:
             return jsonify({"error": "Missing 'logs' field"}), 400
 
-        # Process and enrich logs with human-readable names
         processed_logs = []
-        section_stats = {}  # Track stats per section
-        total_checkpoints = 0
-        total_ir_toggles = 0
-        ultrasonic_events = []
+        raw_logs = data.get("logs", [])
 
-        for log in data.get("logs", []):
-            event_code = log.get("event", 0)
-            event_name = EVENT_CODES.get(event_code, "Unknown")
+        # Detect format based on first log entry
+        has_position = raw_logs and "x" in raw_logs[0] and "y" in raw_logs[0]
+        is_sensor_format = raw_logs and "section_id" in raw_logs[0]
 
-            processed_log = {
-                "event_code": event_code,
-                "event_name": event_name,
-                "timestamp_ms": log.get("timestamp", 0),
-                "raw": log
-            }
+        # Determine data format
+        if has_position:
+            data_format = "path"
+        elif is_sensor_format:
+            data_format = "sensor"
+        else:
+            data_format = "event"
 
-            # Handle specific event types
-            if event_name == "SectionComplete":
-                section_id = log.get("section_id", log.get("data", 0))
-                duration_ms = log.get("duration_ms", log.get("duration", 0))
-                processed_log["section_id"] = section_id
-                processed_log["section_name"] = SECTION_NAMES.get(section_id, f"Section {section_id}")
-                processed_log["duration_ms"] = duration_ms
-                section_stats[section_id] = {
-                    "name": SECTION_NAMES.get(section_id, f"Section {section_id}"),
-                    "duration_ms": duration_ms
-                }
+        for log in raw_logs:
+            if has_position:
+                # New path format with x,y positions
+                section_id = log.get("section_id", 0)
+                processed_logs.append({
+                    "x": log.get("x", 0),
+                    "y": log.get("y", 0),
+                    "segment_id": log.get("segment_id", ""),
+                    "segment_index": log.get("segment_index", 0),
+                    "section_id": section_id,
+                    "section_name": SECTION_NAMES.get(section_id, "Unknown"),
+                    "timestamp_ms": log.get("timestamp", 0),
+                    "checkpoint_success": log.get("checkpoint_success", 0),
+                    "ultrasonic_distance": log.get("ultrasonic_distance", 0),
+                    "claw_status": log.get("claw_status", 0),
+                })
+            elif is_sensor_format:
+                # Sensor data format
+                section_id = log.get("section_id", 0)
+                processed_logs.append({
+                    "section_id": section_id,
+                    "section_name": SECTION_NAMES.get(section_id, "Unknown"),
+                    "timestamp_ms": log.get("timestamp", 0),
+                    "checkpoint_success": log.get("checkpoint_success", 0),
+                    "ultrasonic_distance": log.get("ultrasonic_distance", 0),
+                    "claw_status": log.get("claw_status", 0),
+                    "raw": log
+                })
+            else:
+                # Old event-based format from Arduino EEPROM
+                event_code = log.get("event", 0)
+                zone_id = log.get("data", 0)
+                processed_logs.append({
+                    "event_code": event_code,
+                    "event_name": EVENT_CODES.get(event_code, "Unknown"),
+                    "zone_id": zone_id,
+                    "zone_name": ZONE_NAMES.get(zone_id, "Unknown"),
+                    "timestamp_ms": log.get("timestamp", 0),
+                    "raw": log
+                })
 
-            elif event_name == "Checkpoint":
-                triggered = log.get("triggered", log.get("data", 0))
-                processed_log["checkpoint_triggered"] = triggered == 1
-                if triggered == 1:
-                    total_checkpoints += 1
-
-            elif event_name == "UltrasonicDodge":
-                distance_cm = log.get("distance_cm", log.get("data", 0))
-                processed_log["distance_cm"] = distance_cm
-                ultrasonic_events.append(distance_cm)
-
-            elif event_name == "IRToggle":
-                toggle_count = log.get("toggle_count", log.get("data", 1))
-                processed_log["ir_toggle_count"] = toggle_count
-                total_ir_toggles += toggle_count
-
-            elif event_name == "ServoStateChange":
-                servo_state = log.get("state", log.get("data", 0))
-                processed_log["servo_state"] = servo_state
-                processed_log["servo_state_name"] = SERVO_STATES.get(servo_state, "Unknown")
-
-            # Legacy zone support
-            if "zone_id" in log or (event_code == 2 and "data" in log):
-                zone_id = log.get("zone_id", log.get("data", 0))
-                processed_log["zone_id"] = zone_id
-                processed_log["zone_name"] = ZONE_NAMES.get(zone_id, "Unknown")
-
-            processed_logs.append(processed_log)
-
-        # Create run document with statistics
         run_doc = {
             "robot_id": data.get("robot_id", "unknown"),
             "run_number": data.get("run_number", 0),
             "logs": processed_logs,
+            "events": data.get("events", []),  # Store events separately
+            "segments": data.get("segments", []),  # Store segment data
             "metadata": data.get("metadata", {}),
-            "statistics": {
-                "section_stats": section_stats,
-                "total_checkpoints": total_checkpoints,
-                "total_ir_toggles": total_ir_toggles,
-                "ultrasonic_events": ultrasonic_events,
-                "avg_dodge_distance": sum(ultrasonic_events) / len(ultrasonic_events) if ultrasonic_events else 0,
-                "total_duration_ms": sum(s["duration_ms"] for s in section_stats.values()) if section_stats else 0
-            },
+            "data_format": data_format,
             "created_at": datetime.utcnow(),
             "analyzed": False,
             "analysis": None
@@ -206,24 +199,21 @@ def ingest_data():
         return jsonify({
             "success": True,
             "run_id": str(result.inserted_id),
-            "logs_count": len(processed_logs)
+            "logs_count": len(processed_logs),
+            "events_count": len(data.get("events", [])),
+            "segments_count": len(data.get("segments", []))
         }), 201
 
     except Exception as e:
+        import traceback
+        print(f"INGEST ERROR: {e}")
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/runs", methods=["GET"])
 def get_runs():
-    """
-    GET /runs
-    Return list of past runs with optional filtering.
-
-    Query params:
-    - robot_id: Filter by robot ID
-    - limit: Max number of results (default 50)
-    - skip: Number of results to skip (pagination)
-    """
+    """GET /runs - list runs (supports pagination and robot_id filter)."""
     try:
         robot_id = request.args.get("robot_id")
         limit = int(request.args.get("limit", 50))
@@ -265,17 +255,26 @@ def get_runs():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/runs/clear", methods=["DELETE"])
+def clear_all_runs():
+    """DELETE /runs/clear - delete all runs from the database."""
+    try:
+        result = runs_collection.delete_many({})
+        return jsonify({
+            "success": True,
+            "deleted_count": result.deleted_count
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/runs/<run_id>", methods=["GET"])
 def get_run_detail(run_id):
-    """Get detailed information about a specific run."""
     try:
         run = runs_collection.find_one({"_id": ObjectId(run_id)})
-
         if not run:
             return jsonify({"error": "Run not found"}), 404
-
         return jsonify(serialize_doc(run))
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -285,25 +284,12 @@ def analyze_run():
     """
     POST /analyze
     Send run data to OpenRouter and return AI critique.
-
-    Expected payload:
-    {
-        "run_id": "mongodb_object_id"
-    }
-
-    Or inline data:
-    {
-        "logs": [...],
-        "metadata": {...}
-    }
     """
     try:
         data = request.get_json()
-
         if not data:
             return jsonify({"error": "No data provided"}), 400
 
-        # Get run data either from DB or inline
         if "run_id" in data:
             run = runs_collection.find_one({"_id": ObjectId(data["run_id"])})
             if not run:
@@ -319,45 +305,142 @@ def analyze_run():
         if not logs:
             return jsonify({"error": "No logs to analyze"}), 400
 
-        # Build analysis context
-        zone_sequence = [log["zone_name"] for log in logs if log.get("event_name") == "ZoneChange"]
-        event_summary = {}
-        for log in logs:
-            event_name = log.get("event_name", "Unknown")
-            event_summary[event_name] = event_summary.get(event_name, 0) + 1
+        # Detect data format
+        is_sensor_format = "section_id" in logs[0] if logs else False
 
-        # Calculate time spent in each zone
-        zone_times = {}
-        for i, log in enumerate(logs):
-            if log.get("event_name") == "ZoneChange":
-                zone = log["zone_name"]
-                start_time = log["timestamp_ms"]
-                end_time = logs[i + 1]["timestamp_ms"] if i + 1 < len(logs) else start_time
-                zone_times[zone] = zone_times.get(zone, 0) + (end_time - start_time)
-
-        # Detect potential issues
+        timeline = []
         issues = []
-        for zone, time_ms in zone_times.items():
-            if time_ms > 10000:  # More than 10 seconds in one zone
-                issues.append(f"Stuck in {zone}: {time_ms/1000:.1f}s")
+        section_times = {}
+        section_sequence = []
 
-        # Count oscillations (rapid back-and-forth)
-        oscillations = 0
-        for i in range(2, len(zone_sequence)):
-            if zone_sequence[i] == zone_sequence[i-2] and zone_sequence[i] != zone_sequence[i-1]:
-                oscillations += 1
-        if oscillations > 2:
-            issues.append(f"Oscillation detected: {oscillations} times")
+        if is_sensor_format:
+            # Analyze sensor format data
+            prev_section = None
+            prev_claw = None
+            checkpoint_hits = 0
+            checkpoint_misses = 0
+            ultrasonic_readings = []
 
-        # Prepare prompt for AI
+            for i, log in enumerate(logs):
+                timestamp_ms = log.get("timestamp_ms", 0)
+                section_id = log.get("section_id", 0)
+                section_name = log.get("section_name", "Unknown")
+                checkpoint = log.get("checkpoint_success", 0)
+                ultrasonic = log.get("ultrasonic_distance", 0)
+                claw = log.get("claw_status", 0)
+
+                ultrasonic_readings.append(ultrasonic)
+
+                # Track checkpoint hits/misses
+                if checkpoint == 1:
+                    checkpoint_hits += 1
+                else:
+                    checkpoint_misses += 1
+
+                # Detect section changes
+                if section_id != prev_section:
+                    if prev_section is not None:
+                        timeline.append({
+                            "time_ms": timestamp_ms,
+                            "event": f"Entered {section_name}"
+                        })
+                    section_sequence.append(section_name)
+                    prev_section = section_id
+
+                # Detect claw movements (picking up / dropping)
+                if prev_claw is not None:
+                    if prev_claw < 90 and claw >= 90:
+                        timeline.append({
+                            "time_ms": timestamp_ms,
+                            "event": "Claw closed (picking up)"
+                        })
+                    elif prev_claw >= 90 and claw < 90:
+                        timeline.append({
+                            "time_ms": timestamp_ms,
+                            "event": "Claw opened (dropping)"
+                        })
+                prev_claw = claw
+
+                # Detect obstacles (ultrasonic < 15cm)
+                if ultrasonic < 15 and (i == 0 or logs[i-1].get("ultrasonic_distance", 50) >= 15):
+                    timeline.append({
+                        "time_ms": timestamp_ms,
+                        "event": f"Obstacle detected ({ultrasonic}cm)"
+                    })
+
+            # Add start and end milestones
+            if logs:
+                timeline.insert(0, {"time_ms": 0, "event": "Run started"})
+                timeline.append({"time_ms": logs[-1].get("timestamp_ms", 0), "event": "Run completed"})
+
+            # Sort timeline by time
+            timeline.sort(key=lambda x: x["time_ms"])
+
+            # Calculate section times
+            current_section = None
+            section_start = 0
+            for log in logs:
+                section_name = log.get("section_name", "Unknown")
+                timestamp_ms = log.get("timestamp_ms", 0)
+                if section_name != current_section:
+                    if current_section is not None:
+                        section_times[current_section] = section_times.get(current_section, 0) + (timestamp_ms - section_start)
+                    current_section = section_name
+                    section_start = timestamp_ms
+            # Add final section time
+            if current_section and logs:
+                section_times[current_section] = section_times.get(current_section, 0) + (logs[-1].get("timestamp_ms", 0) - section_start)
+
+            # Calculate metrics
+            total_checkpoints = checkpoint_hits + checkpoint_misses
+            checkpoint_rate = (checkpoint_hits / total_checkpoints * 100) if total_checkpoints > 0 else 0
+            ultrasonic_avg = sum(ultrasonic_readings) / len(ultrasonic_readings) if ultrasonic_readings else 0
+
+            # Detect issues
+            for section, time_ms in section_times.items():
+                if time_ms > 120000:  # More than 2 minutes in one section
+                    issues.append(f"Long time in {section}: {time_ms/1000:.1f}s")
+
+            if checkpoint_rate < 60:
+                issues.append(f"Low checkpoint success rate: {checkpoint_rate:.1f}%")
+
+        else:
+            # Original event-based format analysis
+            zone_sequence = [log["zone_name"] for log in logs if log.get("event_name") == "ZoneChange"]
+            event_summary = {}
+            for log in logs:
+                event_name = log.get("event_name", "Unknown")
+                event_summary[event_name] = event_summary.get(event_name, 0) + 1
+
+            for i, log in enumerate(logs):
+                if log.get("event_name") == "ZoneChange":
+                    zone = log["zone_name"]
+                    start_time = log["timestamp_ms"]
+                    end_time = logs[i + 1]["timestamp_ms"] if i + 1 < len(logs) else start_time
+                    section_times[zone] = section_times.get(zone, 0) + (end_time - start_time)
+
+            for zone, time_ms in section_times.items():
+                if time_ms > 10000:
+                    issues.append(f"Stuck in {zone}: {time_ms/1000:.1f}s")
+
+            oscillations = 0
+            for i in range(2, len(zone_sequence)):
+                if zone_sequence[i] == zone_sequence[i - 2] and zone_sequence[i] != zone_sequence[i - 1]:
+                    oscillations += 1
+            if oscillations > 2:
+                issues.append(f"Oscillation detected: {oscillations} times")
+
+            section_sequence = zone_sequence
+            checkpoint_rate = None
+            ultrasonic_avg = None
+
         prompt = f"""You are an expert robotics coach analyzing a competition run.
 Analyze this robot's performance and provide actionable feedback.
 
 Run Summary:
 - Total Events: {len(logs)}
-- Zone Sequence: {' -> '.join(zone_sequence) if zone_sequence else 'No zone changes recorded'}
-- Event Breakdown: {event_summary}
-- Time in Zones (ms): {zone_times}
+- Section Sequence: {' -> '.join(section_sequence) if section_sequence else 'No section changes recorded'}
+- Time in Sections (ms): {section_times}
 - Detected Issues: {issues if issues else 'None detected'}
 
 Full Event Log (first 50):
@@ -366,23 +449,29 @@ Full Event Log (first 50):
 Please provide:
 1. A brief performance summary
 2. Identified issues (e.g., oscillation, stuck behavior, inefficient pathing)
-3. Specific recommendations with actionable fixes (e.g., "reduce turnAround() angle by 20%")
+3. Specific recommendations with actionable fixes
 4. An overall score out of 10
+"""
 
-Format your response conversationally, as if you're a friendly coach giving feedback."""
+        # Build base analysis with timeline and metrics
+        base_analysis = {
+            "timeline": timeline,
+            "section_sequence": section_sequence,
+            "section_times": section_times,
+            "issues": issues,
+        }
 
-        # Call OpenRouter API
+        # Add sensor-specific metrics if available
+        if is_sensor_format:
+            base_analysis["checkpoint_rate"] = checkpoint_rate
+            base_analysis["ultrasonic_avg"] = ultrasonic_avg
+
         if not OPENROUTER_API_KEY:
-            # Return mock analysis if no API key configured
             analysis = {
-                "summary": "API key not configured. This is a mock analysis.",
-                "issues": issues,
-                "recommendations": ["Configure OPENROUTER_API_KEY in .env file for real AI analysis"],
+                **base_analysis,
+                "summary": "OPENROUTER_API_KEY not configured. This is a mock analysis.",
+                "recommendations": ["Configure OPENROUTER_API_KEY in .env for real AI analysis."],
                 "score": 0,
-                "raw_response": "Mock response - configure API key for real analysis",
-                "zone_sequence": zone_sequence,
-                "zone_times": zone_times,
-                "event_summary": event_summary
             }
         else:
             headers = {
@@ -391,9 +480,8 @@ Format your response conversationally, as if you're a friendly coach giving feed
                 "HTTP-Referer": "https://utra-da.local",
                 "X-Title": "UTRA Data Analysis"
             }
-
             payload = {
-                "model": "openai/gpt-4-turbo-preview",
+                "model": "google/gemini-3-flash-preview",
                 "messages": [
                     {"role": "system", "content": "You are an expert robotics competition coach."},
                     {"role": "user", "content": prompt}
@@ -408,33 +496,20 @@ Format your response conversationally, as if you're a friendly coach giving feed
             raw_content = ai_response["choices"][0]["message"]["content"]
 
             analysis = {
+                **base_analysis,
                 "summary": raw_content,
                 "raw_response": raw_content,
                 "model_used": ai_response.get("model", "unknown"),
                 "usage": ai_response.get("usage", {}),
-                "zone_sequence": zone_sequence,
-                "zone_times": zone_times,
-                "event_summary": event_summary,
-                "issues": issues
             }
 
-        # Update run in DB if we have a run_id
         if run_id:
             runs_collection.update_one(
                 {"_id": ObjectId(run_id)},
-                {
-                    "$set": {
-                        "analyzed": True,
-                        "analysis": analysis,
-                        "analyzed_at": datetime.utcnow()
-                    }
-                }
+                {"$set": {"analyzed": True, "analysis": analysis, "analyzed_at": datetime.utcnow()}}
             )
 
-        return jsonify({
-            "success": True,
-            "analysis": analysis
-        })
+        return jsonify({"success": True, "analysis": analysis})
 
     except requests.RequestException as e:
         return jsonify({"error": f"OpenRouter API error: {str(e)}"}), 502
@@ -444,52 +519,28 @@ Format your response conversationally, as if you're a friendly coach giving feed
 
 @app.route("/telemetry", methods=["POST"])
 def ingest_telemetry():
-    """
-    POST /telemetry
-    Ingest real-time telemetry data during calibration mode.
-
-    Expected payload:
-    {
-        "robot_id": "robot_001",
-        "sensors": {
-            "rgb": {"r": 120, "g": 45, "b": 200},
-            "battery_voltage": 7.4,
-            "zone": "Blue Zone"
-        }
-    }
-    """
+    """POST /telemetry - ingest live telemetry."""
     try:
-        data = request.get_json()
-
+        data = request.get_json() or {}
         telemetry_doc = {
             "robot_id": data.get("robot_id", "unknown"),
             "sensors": data.get("sensors", {}),
             "timestamp": datetime.utcnow()
         }
-
         telemetry_collection.insert_one(telemetry_doc)
-
         return jsonify({"success": True}), 201
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/telemetry/latest", methods=["GET"])
 def get_latest_telemetry():
-    """Get the most recent telemetry reading."""
+    """GET /telemetry/latest - latest telemetry reading."""
     try:
         robot_id = request.args.get("robot_id")
+        query = {"robot_id": robot_id} if robot_id else {}
 
-        query = {}
-        if robot_id:
-            query["robot_id"] = robot_id
-
-        telemetry = telemetry_collection.find_one(
-            query,
-            sort=[("timestamp", -1)]
-        )
-
+        telemetry = telemetry_collection.find_one(query, sort=[("timestamp", -1)])
         if telemetry:
             telemetry["_id"] = str(telemetry["_id"])
             telemetry["timestamp"] = telemetry["timestamp"].isoformat()
@@ -500,7 +551,165 @@ def get_latest_telemetry():
         return jsonify({"error": str(e)}), 500
 
 
+def get_default_segments():
+    """Returns the default path segments for animation."""
+    return [
+        {"id": "s1", "points": [[0, 0], [0, -600]], "duration": 3000},
+        {"id": "s2", "points": [[0, -600], [150, -1125]], "duration": 4000, "pause_duration": 2000, "pause_message": "📦 Picking Up Box"},
+        {"id": "s3", "points": [[150, -1125], [300, -1350]], "duration": 3000},
+        {"id": "s4", "points": [[300, -1350], [600, -1575]], "duration": 4000},
+        {"id": "s5", "points": [[600, -1575], [525, -1800]], "duration": 3000, "pause_duration": 2000, "pause_message": "⚽ Shooting"},
+        {"id": "s6", "points": [[525, -1800], [375, -1650]], "duration": 3000},
+        {"id": "s7", "points": [[375, -1650], [150, -1125]], "duration": 3000, "pause_duration": 2000, "pause_message": "📦 Dropping Box"},
+        {"id": "s8", "points": [[150, -1125], [0, -600]], "duration": 3000},
+        {"id": "s9", "points": [[0, -600], [-120, -825]], "duration": 3000, "pause_duration": 2000, "pause_message": "📦 Picking Up Box"},
+        {"id": "s10", "points": [[-120, -825], [-195, -975]], "duration": 3000},
+        {"id": "s11", "points": [[-195, -975], [-300, -1125]], "duration": 3000},
+        {"id": "s12", "points": [[-300, -1125], [-525, -975]], "duration": 3000},
+        {"id": "s13", "points": [[-525, -975], [-675, -1200]], "duration": 3000},
+        {"id": "s14", "points": [[-675, -1200], [-600, -1650]], "duration": 3000, "pause_duration": 2000, "pause_message": "🚧 Avoiding Obstacle"},
+        {"id": "s15", "points": [[-600, -1650], [-630, -1695]], "duration": 3000},
+        {"id": "s16", "points": [[-630, -1695], [-900, -2100]], "duration": 3000},
+        {"id": "s17", "points": [[-900, -2100], [-975, -1950]], "duration": 3000},
+        {"id": "s18", "points": [[-975, -1950], [-1050, -1725]], "duration": 3000},
+        {"id": "s19", "points": [[-1050, -1725], [-975, -1575]], "duration": 3000, "pause_duration": 2000, "pause_message": "🚧 Avoiding Obstacle"},
+        {"id": "s20", "points": [[-975, -1575], [-900, -1125]], "duration": 3000, "pause_duration": 2000, "pause_message": "📦 Drop Box"},
+        {"id": "s21", "points": [[-900, -1125], [-825, -825]], "duration": 3000},
+        {"id": "s22", "points": [[-825, -825], [0, -600]], "duration": 3000}
+    ]
+
+
+@app.route("/api/path", methods=["GET"])
+def get_path():
+    """GET /api/path - returns default path segments for animation."""
+    try:
+        segments = get_default_segments()
+        return jsonify({"segments": segments})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+ACTION_EMOJIS = {
+    "pickup_box": "📦",
+    "drop_box": "📦",
+    "shooting": "⚽",
+    "avoid_obstacle": "🚧",
+    "stuck": "⚠️",
+    "start": "🚀",
+    "end": "🏁"
+}
+
+ACTION_MESSAGES = {
+    "pickup_box": "Picking Up Box",
+    "drop_box": "Dropping Box",
+    "shooting": "Shooting Ball",
+    "avoid_obstacle": "Avoiding Obstacle",
+    "stuck": "Robot Stuck",
+    "start": "Run Started",
+    "end": "Run Completed"
+}
+
+
+def generate_segments_from_run(run):
+    """Generate path segments from actual run data."""
+    segments = []
+    stored_segments = run.get("segments", [])
+    events = run.get("events", [])
+
+    # Create event lookup by segment_id
+    event_by_segment = {}
+    for event in events:
+        seg_id = event.get("segment_id")
+        if seg_id and event.get("event_type") not in ["start", "end"]:
+            event_by_segment[seg_id] = event
+
+    if stored_segments:
+        # Use stored segment data with actual timings
+        for seg in stored_segments:
+            segment_id = seg.get("segment_id", f"s{seg.get('segment_index', 0) + 1}")
+            start_pos = seg.get("start_pos", [0, 0])
+            end_pos = seg.get("end_pos", [0, 0])
+            duration = seg.get("duration", 1000)
+            action = seg.get("action")
+
+            segment_data = {
+                "id": segment_id,
+                "points": [start_pos, end_pos],
+                "duration": duration
+            }
+
+            # Add pause info from events
+            if segment_id in event_by_segment:
+                event = event_by_segment[segment_id]
+                pause_duration = event.get("pause_duration", 0)
+                if pause_duration > 0:
+                    event_type = event.get("event_type", "")
+                    emoji = ACTION_EMOJIS.get(event_type, "")
+                    message = ACTION_MESSAGES.get(event_type, event.get("message", ""))
+                    segment_data["pause_duration"] = pause_duration
+                    segment_data["pause_message"] = f"{emoji} {message}".strip()
+            elif action:
+                # Fallback to action field if no event found
+                emoji = ACTION_EMOJIS.get(action, "")
+                message = ACTION_MESSAGES.get(action, action)
+                segment_data["pause_duration"] = 1500
+                segment_data["pause_message"] = f"{emoji} {message}".strip()
+
+            segments.append(segment_data)
+
+    return segments
+
+
+@app.route("/api/path/<run_id>", methods=["GET"])
+def get_path_for_run(run_id):
+    """GET /api/path/<run_id> - returns path segments for a specific run."""
+    try:
+        run = runs_collection.find_one({"_id": ObjectId(run_id)})
+        if not run:
+            return jsonify({"error": "Run not found"}), 404
+
+        # Check if run has segment data
+        if run.get("segments") or run.get("data_format") == "path":
+            segments = generate_segments_from_run(run)
+            if segments:
+                # Also return events for timeline display
+                events = run.get("events", [])
+                return jsonify({
+                    "segments": segments,
+                    "events": events,
+                    "metadata": run.get("metadata", {}),
+                    "duration_ms": run.get("metadata", {}).get("duration_ms", 0)
+                })
+
+        # Fallback to default segments
+        segments = get_default_segments()
+        return jsonify({"segments": segments})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# -----------------------------------------------------------------------------
+# Frontend Serving (Production Build)
+# -----------------------------------------------------------------------------
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    """
+    Serve the built React frontend (frontend/dist).
+    If dist does not exist, return a helpful message.
+    """
+    if os.path.isdir(DIST_DIR):
+        if path != "" and os.path.exists(os.path.join(DIST_DIR, path)):
+            return send_from_directory(DIST_DIR, path)
+        return send_from_directory(DIST_DIR, "index.html")
+
+    return jsonify({
+        "message": "Frontend build not found. Run `npm run build` in frontend/ to create dist/.",
+        "hint": "For development, use Vite dev server at http://localhost:5173."
+    }), 404
+
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
+    port = int(os.getenv("PORT", 5001))
     debug = os.getenv("FLASK_ENV") == "development"
     app.run(host="0.0.0.0", port=port, debug=debug)

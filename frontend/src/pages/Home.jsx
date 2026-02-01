@@ -25,7 +25,7 @@ function Home() {
               <span>DIVISION: SOFTWARE</span>
             </div>
             <button className="cta-btn" onClick={() => navigate('/dashboard')}>
-              LAUNCH MISSION CONTROL <ArrowRight size={20} />
+              ANALYTICS <ArrowRight size={20} />
             </button>
           </div>
         </section>

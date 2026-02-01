@@ -39,13 +39,32 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Event code mappings (from Arduino EEPROM)
 EVENT_CODES = {
     1: "Start",
-    2: "ZoneChange",
-    3: "Shot",
-    4: "Obstacle",
-    5: "Stop",
-    6: "Error"
+    2: "SectionComplete",
+    3: "Checkpoint",
+    4: "UltrasonicDodge",
+    5: "IRToggle",
+    6: "ServoStateChange",
+    7: "Stop",
+    8: "Error"
 }
 
+# Section IDs for the track
+SECTION_NAMES = {
+    0: "Start Zone",
+    1: "Red Path",
+    2: "Ramp",
+    3: "Green Path",
+    4: "Obstacle Zone",
+    5: "Target Zone"
+}
+
+# Servo states
+SERVO_STATES = {
+    0: "Travel",
+    1: "Grabbed Box"
+}
+
+# Legacy zone names (kept for compatibility)
 ZONE_NAMES = {
     0: "Start",
     1: "Red Zone",
@@ -106,24 +125,77 @@ def ingest_data():
 
         # Process and enrich logs with human-readable names
         processed_logs = []
+        section_stats = {}  # Track stats per section
+        total_checkpoints = 0
+        total_ir_toggles = 0
+        ultrasonic_events = []
+
         for log in data.get("logs", []):
             event_code = log.get("event", 0)
-            zone_id = log.get("data", 0)
-            processed_logs.append({
+            event_name = EVENT_CODES.get(event_code, "Unknown")
+
+            processed_log = {
                 "event_code": event_code,
-                "event_name": EVENT_CODES.get(event_code, "Unknown"),
-                "zone_id": zone_id,
-                "zone_name": ZONE_NAMES.get(zone_id, "Unknown"),
+                "event_name": event_name,
                 "timestamp_ms": log.get("timestamp", 0),
                 "raw": log
-            })
+            }
 
-        # Create run document
+            # Handle specific event types
+            if event_name == "SectionComplete":
+                section_id = log.get("section_id", log.get("data", 0))
+                duration_ms = log.get("duration_ms", log.get("duration", 0))
+                processed_log["section_id"] = section_id
+                processed_log["section_name"] = SECTION_NAMES.get(section_id, f"Section {section_id}")
+                processed_log["duration_ms"] = duration_ms
+                section_stats[section_id] = {
+                    "name": SECTION_NAMES.get(section_id, f"Section {section_id}"),
+                    "duration_ms": duration_ms
+                }
+
+            elif event_name == "Checkpoint":
+                triggered = log.get("triggered", log.get("data", 0))
+                processed_log["checkpoint_triggered"] = triggered == 1
+                if triggered == 1:
+                    total_checkpoints += 1
+
+            elif event_name == "UltrasonicDodge":
+                distance_cm = log.get("distance_cm", log.get("data", 0))
+                processed_log["distance_cm"] = distance_cm
+                ultrasonic_events.append(distance_cm)
+
+            elif event_name == "IRToggle":
+                toggle_count = log.get("toggle_count", log.get("data", 1))
+                processed_log["ir_toggle_count"] = toggle_count
+                total_ir_toggles += toggle_count
+
+            elif event_name == "ServoStateChange":
+                servo_state = log.get("state", log.get("data", 0))
+                processed_log["servo_state"] = servo_state
+                processed_log["servo_state_name"] = SERVO_STATES.get(servo_state, "Unknown")
+
+            # Legacy zone support
+            if "zone_id" in log or (event_code == 2 and "data" in log):
+                zone_id = log.get("zone_id", log.get("data", 0))
+                processed_log["zone_id"] = zone_id
+                processed_log["zone_name"] = ZONE_NAMES.get(zone_id, "Unknown")
+
+            processed_logs.append(processed_log)
+
+        # Create run document with statistics
         run_doc = {
             "robot_id": data.get("robot_id", "unknown"),
             "run_number": data.get("run_number", 0),
             "logs": processed_logs,
             "metadata": data.get("metadata", {}),
+            "statistics": {
+                "section_stats": section_stats,
+                "total_checkpoints": total_checkpoints,
+                "total_ir_toggles": total_ir_toggles,
+                "ultrasonic_events": ultrasonic_events,
+                "avg_dodge_distance": sum(ultrasonic_events) / len(ultrasonic_events) if ultrasonic_events else 0,
+                "total_duration_ms": sum(s["duration_ms"] for s in section_stats.values()) if section_stats else 0
+            },
             "created_at": datetime.utcnow(),
             "analyzed": False,
             "analysis": None
